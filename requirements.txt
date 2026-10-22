@@ -1,0 +1,138 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from pathlib import Path
+from datetime import date, datetime
+import sqlite3, os, csv, io
+from flask import Response
+
+BASE = Path(__file__).resolve().parent
+DB = BASE / 'pharmacy.db'
+app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'local-development-only-change-me')
+
+def connect():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.execute('PRAGMA foreign_keys=ON')
+    return c
+
+def init_db():
+    with connect() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS medicines(id INTEGER PRIMARY KEY, name TEXT NOT NULL, company TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS batches(id INTEGER PRIMARY KEY, medicine_id INTEGER NOT NULL REFERENCES medicines(id), batch_no TEXT NOT NULL, expiry TEXT NOT NULL, mrp REAL NOT NULL CHECK(mrp>=0), purchase_rate REAL NOT NULL CHECK(purchase_rate>=0), sale_rate REAL NOT NULL CHECK(sale_rate>=0), stock INTEGER NOT NULL DEFAULT 0 CHECK(stock>=0), UNIQUE(medicine_id,batch_no,expiry));
+        CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY, batch_id INTEGER NOT NULL REFERENCES batches(id), supplier TEXT NOT NULL DEFAULT '', quantity INTEGER NOT NULL CHECK(quantity>0), rate REAL NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sales(id INTEGER PRIMARY KEY, customer TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, total REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS sale_items(id INTEGER PRIMARY KEY, sale_id INTEGER NOT NULL REFERENCES sales(id), batch_id INTEGER NOT NULL REFERENCES batches(id), medicine_name TEXT NOT NULL, batch_no TEXT NOT NULL, qty INTEGER NOT NULL, rate REAL NOT NULL, amount REAL NOT NULL);
+        ''')
+init_db()
+
+def money(v):
+    return f'₹{v:,.2f}'
+app.jinja_env.filters['money'] = money
+
+@app.route('/')
+def dashboard():
+    with connect() as c:
+        metrics = dict(medicines=c.execute('SELECT COUNT(*) FROM medicines').fetchone()[0], stock=c.execute('SELECT COALESCE(SUM(stock),0) FROM batches').fetchone()[0], low=c.execute('SELECT COUNT(*) FROM batches WHERE stock BETWEEN 1 AND 10').fetchone()[0], expired=c.execute('SELECT COUNT(*) FROM batches WHERE stock>0 AND expiry < ?', (date.today().isoformat(),)).fetchone()[0], sales=c.execute('SELECT COALESCE(SUM(total),0) FROM sales WHERE substr(created_at,1,10)=?', (date.today().isoformat(),)).fetchone()[0])
+        recent = c.execute('SELECT * FROM sales ORDER BY id DESC LIMIT 8').fetchall()
+    return render_template('dashboard.html', metrics=metrics, recent=recent)
+
+@app.route('/medicines', methods=['GET','POST'])
+def medicines():
+    with connect() as c:
+        if request.method == 'POST':
+            name = request.form.get('name','').strip()
+            company = request.form.get('company','').strip()
+            batch = request.form.get('batch_no','').strip()
+            expiry = request.form.get('expiry','').strip()
+            try:
+                if not name or not batch: raise ValueError('Medicine name and batch are required')
+                date.fromisoformat(expiry)
+                mrp = float(request.form['mrp']); purchase = float(request.form['purchase_rate']); sale = float(request.form['sale_rate']); stock = int(request.form['stock'])
+                if min(mrp,purchase,sale,stock) < 0: raise ValueError('Negative values not allowed')
+                c.execute('INSERT INTO medicines(name,company) VALUES(?,?)', (name,company))
+                mid = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                c.execute('INSERT INTO batches(medicine_id,batch_no,expiry,mrp,purchase_rate,sale_rate,stock) VALUES(?,?,?,?,?,?,?)',(mid,batch,expiry,mrp,purchase,sale,stock))
+                c.commit()
+                flash('Medicine and batch saved.', 'success')
+                return redirect(url_for('medicines'))
+            except (ValueError,sqlite3.IntegrityError,KeyError) as e:
+                flash(f'Unable to save: {e}', 'error')
+        rows = c.execute('''SELECT b.*,m.name,m.company FROM batches b JOIN medicines m ON m.id=b.medicine_id ORDER BY m.name,b.expiry''').fetchall()
+    return render_template('medicines.html', rows=rows, today=date.today().isoformat())
+
+@app.route('/purchase', methods=['GET','POST'])
+def purchase():
+    with connect() as c:
+        if request.method == 'POST':
+            try:
+                batch_id = int(request.form['batch_id']); qty = int(request.form['qty']); rate = float(request.form['rate']); supplier = request.form.get('supplier','').strip()
+                if qty <= 0 or rate < 0: raise ValueError('Invalid quantity or rate')
+                with c:
+                    changed = c.execute('UPDATE batches SET stock=stock+?, purchase_rate=? WHERE id=?',(qty,rate,batch_id)).rowcount
+                    if changed != 1: raise ValueError('Batch not found')
+                    c.execute('INSERT INTO purchases(batch_id,supplier,quantity,rate,created_at) VALUES(?,?,?,?,?)',(batch_id,supplier,qty,rate,datetime.now().isoformat(timespec='seconds')))
+                flash('Purchase recorded and stock updated.', 'success')
+                return redirect(url_for('purchase'))
+            except (ValueError,KeyError) as e: flash(f'Purchase failed: {e}','error')
+        batches = c.execute('SELECT b.*,m.name FROM batches b JOIN medicines m ON m.id=b.medicine_id ORDER BY m.name').fetchall()
+        history = c.execute('SELECT p.*,m.name,b.batch_no FROM purchases p JOIN batches b ON b.id=p.batch_id JOIN medicines m ON m.id=b.medicine_id ORDER BY p.id DESC LIMIT 30').fetchall()
+    return render_template('purchase.html', batches=batches, history=history)
+
+@app.route('/billing', methods=['GET','POST'])
+def billing():
+    with connect() as c:
+        if request.method == 'POST':
+            try:
+                ids = request.form.getlist('batch_id[]'); qtys = request.form.getlist('qty[]')
+                if not ids or len(ids)!=len(qtys): raise ValueError('Add at least one item')
+                quantities = {}
+                for bid,q in zip(ids,qtys):
+                    bid=int(bid); q=int(q)
+                    if q <= 0: raise ValueError('Quantity must be positive')
+                    quantities[bid]=quantities.get(bid,0)+q
+                customer=request.form.get('customer','').strip()
+                with c:
+                    c.execute('BEGIN IMMEDIATE')
+                    items=[]; total=0
+                    for bid,qty in quantities.items():
+                        b=c.execute('SELECT b.*,m.name FROM batches b JOIN medicines m ON m.id=b.medicine_id WHERE b.id=?',(bid,)).fetchone()
+                        if not b: raise ValueError('Medicine batch not found')
+                        if b['expiry'] < date.today().isoformat(): raise ValueError(f"Expired: {b['name']} / {b['batch_no']}")
+                        if b['stock'] < qty: raise ValueError(f"Insufficient stock: {b['name']} (available {b['stock']})")
+                        amount=round(qty*b['sale_rate'],2); total+=amount
+                        items.append((bid,b['name'],b['batch_no'],qty,b['sale_rate'],amount))
+                    cur=c.execute('INSERT INTO sales(customer,created_at,total) VALUES(?,?,?)',(customer,datetime.now().isoformat(timespec='seconds'),round(total,2)))
+                    for bid,name,batch,qty,rate,amount in items:
+                        c.execute('UPDATE batches SET stock=stock-? WHERE id=?',(qty,bid))
+                        c.execute('INSERT INTO sale_items(sale_id,batch_id,medicine_name,batch_no,qty,rate,amount) VALUES(?,?,?,?,?,?,?)',(cur.lastrowid,bid,name,batch,qty,rate,amount))
+                return redirect(url_for('invoice', sale_id=cur.lastrowid))
+            except (ValueError,KeyError,sqlite3.Error) as e: flash(f'Billing failed: {e}', 'error')
+        batches=c.execute('SELECT b.*,m.name FROM batches b JOIN medicines m ON m.id=b.medicine_id WHERE b.stock>0 AND b.expiry>=? ORDER BY m.name,b.expiry',(date.today().isoformat(),)).fetchall()
+    return render_template('billing.html', batches=batches)
+
+@app.route('/invoice/<int:sale_id>')
+def invoice(sale_id):
+    with connect() as c:
+        sale=c.execute('SELECT * FROM sales WHERE id=?',(sale_id,)).fetchone()
+        items=c.execute('SELECT * FROM sale_items WHERE sale_id=?',(sale_id,)).fetchall()
+    if not sale: return 'Invoice not found',404
+    return render_template('invoice.html', sale=sale, items=items)
+
+@app.route('/reports')
+def reports():
+    with connect() as c:
+        daily=c.execute('SELECT substr(created_at,1,10) AS day,COUNT(*) AS bills,SUM(total) AS total FROM sales GROUP BY day ORDER BY day DESC LIMIT 31').fetchall()
+        monthly=c.execute('SELECT substr(created_at,1,7) AS month,COUNT(*) AS bills,SUM(total) AS total FROM sales GROUP BY month ORDER BY month DESC LIMIT 12').fetchall()
+        sales=c.execute('SELECT * FROM sales ORDER BY id DESC LIMIT 100').fetchall()
+        alerts=c.execute('SELECT b.*,m.name FROM batches b JOIN medicines m ON m.id=b.medicine_id WHERE b.stock>0 AND (b.stock<=10 OR b.expiry<=date(\'now\',\'+90 days\')) ORDER BY b.expiry').fetchall()
+    return render_template('reports.html', daily=daily,monthly=monthly,sales=sales,alerts=alerts,today=date.today().isoformat())
+
+@app.route('/reports/csv')
+def reports_csv():
+    with connect() as c: rows=c.execute('SELECT id,created_at,customer,total FROM sales ORDER BY id DESC').fetchall()
+    out=io.StringIO(); writer=csv.writer(out); writer.writerow(['Bill No','Date','Customer','Total']); writer.writerows([tuple(row) for row in rows])
+    return Response('\ufeff'+out.getvalue(), mimetype='text/csv',headers={'Content-Disposition':'attachment; filename=sales_report.csv'})
+
+if __name__ == '__main__':
+    app.run(debug=True,host='127.0.0.1',port=5000)
